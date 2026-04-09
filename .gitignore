@@ -5,3 +5,7 @@ Thumbs.db
 .vscode/
 *.swp
 *.swo
+__pycache__/
+.pytest_cache/
+.venv/
+saved_analyses/
