@@ -1,33 +1,89 @@
-from __future__ import annotations
+"""
+Timezone handling, display conversion, and date/time filtering.
 
-from datetime import date, time
-from zoneinfo import ZoneInfo
+All internal calculations use UTC. Timezone conversion is display-only.
+"""
+
+from __future__ import annotations
 
 import pandas as pd
 
 
-def localize_for_display(df: pd.DataFrame, timezone_name: str) -> pd.DataFrame:
-    localized = df.copy()
-    tz = ZoneInfo(timezone_name)
-    localized["datetime_display"] = localized["datetime_utc"].dt.tz_convert(tz)
-    return localized
+def localize_for_display(df: pd.DataFrame, timezone: str) -> pd.DataFrame:
+    """
+    Add a 'datetime_display' column converted from UTC to the display timezone.
+
+    The source column 'datetime_utc' must be timezone-aware (UTC).
+    """
+    out = df.copy()
+    out["datetime_display"] = out["datetime_utc"].dt.tz_convert(timezone)
+    return out
 
 
-def filter_by_date_and_time(
+def filter_by_date_range(
     df: pd.DataFrame,
-    timezone_name: str,
-    start_date: date,
-    end_date: date,
-    start_time: time,
-    end_time: time,
+    start_date: pd.Timestamp | None = None,
+    end_date: pd.Timestamp | None = None,
+    timezone: str = "UTC",
 ) -> pd.DataFrame:
-    localized = localize_for_display(df, timezone_name)
-    mask = localized["datetime_display"].dt.date.between(start_date, end_date)
+    """
+    Filter rows by date range using display-timezone dates.
 
-    display_time = localized["datetime_display"].dt.time
-    if start_time <= end_time:
-        time_mask = display_time.between(start_time, end_time)
-    else:
-        time_mask = (display_time >= start_time) | (display_time <= end_time)
+    start_date and end_date should be naive date objects (from a date picker).
+    They are interpreted in the given timezone.
+    """
+    if start_date is None and end_date is None:
+        return df
 
-    return localized[mask & time_mask].copy()
+    display_col = "datetime_display" if "datetime_display" in df.columns else "datetime_utc"
+    dates = df[display_col].dt.date
+
+    mask = pd.Series(True, index=df.index)
+    if start_date is not None:
+        mask &= dates >= start_date
+    if end_date is not None:
+        mask &= dates <= end_date
+
+    return df[mask].reset_index(drop=True)
+
+
+def filter_by_time_range(
+    df: pd.DataFrame,
+    start_time=None,
+    end_time=None,
+) -> pd.DataFrame:
+    """
+    Filter rows by time-of-day range using display-timezone times.
+
+    Handles wraparound (e.g., 22:00 to 06:00).
+    """
+    if start_time is None and end_time is None:
+        return df
+
+    display_col = "datetime_display" if "datetime_display" in df.columns else "datetime_utc"
+    times = df[display_col].dt.time
+
+    mask = pd.Series(True, index=df.index)
+    if start_time is not None and end_time is not None:
+        if start_time <= end_time:
+            mask = (times >= start_time) & (times <= end_time)
+        else:
+            # Wraparound: e.g., 22:00 to 06:00
+            mask = (times >= start_time) | (times <= end_time)
+    elif start_time is not None:
+        mask = times >= start_time
+    elif end_time is not None:
+        mask = times <= end_time
+
+    return df[mask].reset_index(drop=True)
+
+
+def compute_relative_minutes(df: pd.DataFrame, start_epoch: int) -> pd.DataFrame:
+    """
+    Add a 'minutes' column showing elapsed minutes from a reference epoch.
+
+    Used for Event Analysis charts where x-axis shows relative time.
+    """
+    out = df.copy()
+    out["minutes"] = (out["epoch_time_utc"] - start_epoch) / 60.0
+    return out

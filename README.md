@@ -1,50 +1,73 @@
-# GCP2 Data Analysis App
+# GCP2 Consciousness Data Analyzer
 
-Streamlit application for exploring GCP 2.0 Device Coherence and Network Coherence CSV downloads.
+A free, publicly accessible web application for analyzing Random Number Generator (RNG) data from the [Global Consciousness Project 2.0](https://gcp2.net).
 
-## Current V1 foundation
+## What It Does
 
-- upload `csv` or zipped `csv` files
-- detect `device` vs `network` data
-- filter by date range and time-of-day
-- display device and network charts
-- compare up to 4 device files
-- export filtered data to CSV
-- export charts to PNG
-- save analysis metadata locally
-- use bundled demo data for quick evaluation
+- Upload **Device Coherence** and **Network Coherence** CSV files from gcp2.net
+- Analyze device activity and identify periods of statistical significance
+- Generate **Event Analysis charts** (Red Curve + Blue Envelope) matching GCP2.net
+- Compare multiple devices side by side
+- Correlate device coherence with global network coherence
+- Generate detailed reports and export charts as PNG/PDF
 
-## Local setup
+## Getting Started
+
+### Prerequisites
+
+- Python 3.11+
+- pip
+
+### Installation
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
+git clone https://github.com/rameshguda/gcp2-analyzer.git
+cd gcp2-analyzer
 pip install -r requirements.txt
+```
+
+### Run the App
+
+```bash
 streamlit run app.py
 ```
 
-## Public deployment
+The app will open in your browser at `http://localhost:8501`.
 
-This repository is designed to be deployed as a public Streamlit app.
+### Get Data
 
-Recommended path:
+1. Go to [gcp2.net](https://gcp2.net) > Data & Results > Data Download
+2. Download **Device Coherence** CSV for your device(s)
+3. Download **Network Coherence** CSV for the time period you want to analyze
+4. Upload the files in the app sidebar
 
-1. Push this repository to GitHub
-2. Connect the GitHub repo to Streamlit Community Cloud
-3. Deploy `app.py`
-4. Share the public app URL with users
+## Technical Reference
 
-Anyone with the deployed app link will be able to open the app, upload their own data files, and run the analysis in the browser.
+See [GCP2_APP_DEVELOPMENT_PROMPT.md](GCP2_APP_DEVELOPMENT_PROMPT.md) for the complete technical specification, including:
 
-See also:
+- Mathematical foundations (cumulative sum, chi-squared envelope, significance thresholds)
+- Chart plotting specifications (exact colors, axes, visual components)
+- Data schema and ingestion details
+- Analysis engine and report generation specs
 
-- [Deployment guide](/Users/heartmath/Documents/GCP2_Data/DEPLOYMENT.md)
+## Data Sources
 
-## Sample files
+All data comes from CSV files downloaded from [gcp2.net](https://gcp2.net). This app does not connect to any external APIs or store user data.
 
-Place GCP2 sample files in `resources/`.
+### Supported File Types
 
-Currently validated against:
+| File Type | Columns | Granularity |
+|-----------|---------|-------------|
+| Device Coherence | device_number, epoch_time_utc, active_seconds, device_coherence, significance | ~1 min |
+| Network Coherence | epoch_time_utc, network_coherence, active_devices | 1 sec |
 
-- `GCP2_Device_Coherence_Device_337_Latest.csv`
-- `GCP2_Network_Coherence_Global_Network_2026_03.csv.zip`
+## License
+
+MIT
+
+## Acknowledgments
+
+- [Global Consciousness Project 2.0](https://gcp2.net) for the data and scientific methodology
+- [HeartMath Institute](https://www.heartmath.org) for research and device hosting
+- [vfp2/gcp2-playbox](https://github.com/vfp2/gcp2-playbox) for reference implementations
+- Bancel & Nelson (2008), Journal of Scientific Exploration, for the mathematical foundations
