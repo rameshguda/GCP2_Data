@@ -38,6 +38,7 @@ from src.plots import (
     correlation_dual_axis_chart,
     device_timeline_chart,
     multi_device_chart,
+    multi_device_network_chart,
     network_event_analysis_chart,
     raw_network_chart,
 )
@@ -483,93 +484,115 @@ else:
         with tabs[tab_idx]:
             st.header("Device-Network Correlation")
 
-            # Select which device and network to correlate
+            # Select devices (multi) and network
             dev_labels = list(st.session_state["device_datasets"].keys())
             net_labels = list(st.session_state["network_datasets"].keys())
 
             cc1, cc2 = st.columns(2)
             with cc1:
-                sel_device = st.selectbox("Select Device", dev_labels, key="corr_dev")
+                sel_devices = st.multiselect(
+                    "Select Devices (up to 5)", dev_labels,
+                    default=dev_labels[:2] if len(dev_labels) >= 2 else dev_labels[:1],
+                    max_selections=5, key="corr_devs",
+                )
             with cc2:
                 sel_network = st.selectbox("Select Network", net_labels, key="corr_net")
 
-            dev_ds = st.session_state["device_datasets"][sel_device]
-            net_ds = st.session_state["network_datasets"][sel_network]
-
-            dev_filtered = _apply_filters(dev_ds.df, timezone, date_range, time_filter)
-            net_filtered = _apply_filters(net_ds.df, timezone, date_range, time_filter)
-
-            if dev_filtered.empty or net_filtered.empty:
-                st.warning("One or both datasets have no data in the selected range.")
+            if not sel_devices:
+                st.info("Select at least one device to correlate with the network.")
             else:
-                # Align data
-                aligned = align_device_network(dev_filtered, net_filtered)
+                net_ds = st.session_state["network_datasets"][sel_network]
+                net_filtered = _apply_filters(net_ds.df, timezone, date_range, time_filter)
 
-                if aligned.empty:
-                    st.warning("No overlapping time range between the selected device and network data. Check your date filters.")
+                if net_filtered.empty:
+                    st.warning("Network dataset has no data in the selected range.")
                 else:
-                    st.markdown(f"**{len(aligned)}** overlapping minutes found.")
+                    # Align each selected device with the network
+                    device_frames = []  # (label, aligned_df)
+                    for dev_label in sel_devices:
+                        dev_ds = st.session_state["device_datasets"][dev_label]
+                        dev_filtered = _apply_filters(dev_ds.df, timezone, date_range, time_filter)
+                        if dev_filtered.empty:
+                            st.warning(f"{dev_label}: no data in the selected range.")
+                            continue
+                        aligned = align_device_network(dev_filtered, net_filtered)
+                        if aligned.empty:
+                            st.warning(f"{dev_label}: no overlapping time range with network.")
+                            continue
+                        device_frames.append((dev_label, aligned))
 
-                    # Concurrent significance
-                    concurrent = find_concurrent_significance(aligned)
-                    corr_sum = correlation_summary(aligned, concurrent, sel_device, sel_network)
+                    if not device_frames:
+                        st.warning("No overlapping data found. Check your date filters.")
+                    else:
+                        total_minutes = max(len(adf) for _, adf in device_frames)
+                        st.markdown(f"**{total_minutes}** overlapping minutes found across {len(device_frames)} device(s).")
 
-                    # Summary metrics
-                    mc1, mc2, mc3, mc4 = st.columns(4)
-                    mc1.metric("Overlap", f"{corr_sum['overlap_minutes']} min")
-                    mc2.metric("Device Elevated+", f"{corr_sum['device_elevated_minutes']} min")
-                    mc3.metric("Network Significant", f"{corr_sum['network_significant_minutes']} min")
-                    mc4.metric("Concurrent", f"{corr_sum['concurrent_minutes']} min ({corr_sum['period_count']} windows)")
+                        # Use the first device for summary/concurrent analysis
+                        primary_label, primary_aligned = device_frames[0]
+                        concurrent = find_concurrent_significance(primary_aligned)
+                        corr_sum = correlation_summary(primary_aligned, concurrent, primary_label, sel_network)
 
-                    corr_tabs = st.tabs(["Correlation Chart", "Concurrent Periods", "Report"])
+                        # Summary metrics
+                        mc1, mc2, mc3, mc4 = st.columns(4)
+                        mc1.metric("Overlap", f"{corr_sum['overlap_minutes']} min")
+                        mc2.metric(f"{primary_label} Elevated+", f"{corr_sum['device_elevated_minutes']} min")
+                        mc3.metric("Network Significant", f"{corr_sum['network_significant_minutes']} min")
+                        mc4.metric("Concurrent", f"{corr_sum['concurrent_minutes']} min ({corr_sum['period_count']} windows)")
 
-                    # ── Correlation Chart ─────────────────────
-                    with corr_tabs[0]:
-                        fig = correlation_dual_axis_chart(aligned, sel_device, sel_network)
-                        st.plotly_chart(fig, use_container_width=True)
+                        corr_tabs = st.tabs(["Correlation Chart", "Concurrent Periods", "Report"])
 
-                        ca, cb = st.columns(2)
-                        with ca:
-                            png = fig.to_image(format="png", width=1600, height=900, scale=2)
-                            st.download_button("Download Chart (PNG)", data=png,
-                                file_name="GCP2_Correlation_Chart.png",
-                                mime="image/png", key="corr_png")
-                        with cb:
-                            csv = aligned.to_csv(index=False).encode("utf-8")
-                            st.download_button("Download Aligned Data (CSV)", data=csv,
-                                file_name="GCP2_Correlation_Data.csv",
-                                mime="text/csv", key="corr_csv")
+                        # ── Correlation Chart ─────────────────────
+                        with corr_tabs[0]:
+                            chart_title = " & ".join(l for l, _ in device_frames) + f" vs {sel_network}"
+                            fig = multi_device_network_chart(device_frames, sel_network, chart_title)
+                            st.plotly_chart(fig, use_container_width=True)
 
-                    # ── Concurrent Periods ────────────────────
-                    with corr_tabs[1]:
-                        if concurrent:
-                            for i, p in enumerate(concurrent[:10], 1):
-                                st.markdown(
-                                    f"**{i}. {p['start_time']} to {p['end_time']}** ({p['duration_minutes']} min)\n\n"
-                                    f"- Device peak: {p['device_peak']} ({p['device_peak_significance']})\n"
-                                    f"- Network cumsum: {p['network_cumsum_peak']:+.1f} ({p['network_direction']})"
-                                )
-                        else:
-                            st.info("No periods of simultaneous device + network significance found in this range.")
+                            ca, cb = st.columns(2)
+                            with ca:
+                                png = fig.to_image(format="png", width=1600, height=900, scale=2)
+                                st.download_button("Download Chart (PNG)", data=png,
+                                    file_name="GCP2_Correlation_Chart.png",
+                                    mime="image/png", key="corr_png")
+                            with cb:
+                                csv = primary_aligned.to_csv(index=False).encode("utf-8")
+                                st.download_button("Download Aligned Data (CSV)", data=csv,
+                                    file_name="GCP2_Correlation_Data.csv",
+                                    mime="text/csv", key="corr_csv")
 
-                    # ── Report ────────────────────────────────
-                    with corr_tabs[2]:
-                        dr_str = _date_range_str(dev_filtered, timezone)
-                        report_text = generate_correlation_report_text(
-                            corr_sum, concurrent, dr_str, timezone
-                        )
-                        st.text_area("Report Preview", report_text, height=400, key="corr_rpt")
+                        # ── Concurrent Periods ────────────────────
+                        with corr_tabs[1]:
+                            if concurrent:
+                                for i, p in enumerate(concurrent[:10], 1):
+                                    st.markdown(
+                                        f"**{i}. {p['start_time']} to {p['end_time']}** ({p['duration_minutes']} min)\n\n"
+                                        f"- Device peak: {p['device_peak']} ({p['device_peak_significance']})\n"
+                                        f"- Network cumsum: {p['network_cumsum_peak']:+.1f} ({p['network_direction']})"
+                                    )
+                            else:
+                                st.info("No periods of simultaneous device + network significance found in this range.")
 
-                        ra, rb = st.columns(2)
-                        with ra:
-                            st.download_button("Download Report (TXT)", data=report_text,
-                                file_name="GCP2_Correlation_Report.txt",
-                                mime="text/plain", key="corr_txt")
-                        with rb:
-                            chart_png = fig.to_image(format="png", width=1600, height=900, scale=2)
-                            pdf_bytes = generate_correlation_report_pdf(
-                                corr_sum, concurrent, dr_str, timezone, chart_png
+                        # ── Report ────────────────────────────────
+                        with corr_tabs[2]:
+                            dev_filtered_primary = _apply_filters(
+                                st.session_state["device_datasets"][primary_label].df,
+                                timezone, date_range, time_filter,
                             )
-                            st.download_button("Download Report (PDF)", data=pdf_bytes,
-                                file_name="GCP2_Correlation_Report.pdf",
-                                mime="application/pdf", key="corr_pdf")
+                            dr_str = _date_range_str(dev_filtered_primary, timezone)
+                            report_text = generate_correlation_report_text(
+                                corr_sum, concurrent, dr_str, timezone
+                            )
+                            st.text_area("Report Preview", report_text, height=400, key="corr_rpt")
+
+                            ra, rb = st.columns(2)
+                            with ra:
+                                st.download_button("Download Report (TXT)", data=report_text,
+                                    file_name="GCP2_Correlation_Report.txt",
+                                    mime="text/plain", key="corr_txt")
+                            with rb:
+                                chart_png = fig.to_image(format="png", width=1600, height=900, scale=2)
+                                pdf_bytes = generate_correlation_report_pdf(
+                                    corr_sum, concurrent, dr_str, timezone, chart_png
+                                )
+                                st.download_button("Download Report (PDF)", data=pdf_bytes,
+                                    file_name="GCP2_Correlation_Report.pdf",
+                                    mime="application/pdf", key="corr_pdf")

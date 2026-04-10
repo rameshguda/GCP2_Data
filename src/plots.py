@@ -346,35 +346,66 @@ def correlation_dual_axis_chart(
     title: str = "Device-Network Correlation",
 ) -> go.Figure:
     """
-    Dual-axis chart showing device coherence and network cumulative sum
-    on the same time axis.
+    Dual-axis chart: single device vs network.
 
     Left Y-axis:  Device Coherence (area fill)
+    Right Y-axis: Network Cumulative Sum (Red Curve + Blue Envelope)
+    """
+    return multi_device_network_chart(
+        [(device_label, aligned_df)],
+        network_label=network_label,
+        title=title,
+    )
+
+
+def multi_device_network_chart(
+    device_frames: list[tuple[str, pd.DataFrame]],
+    network_label: str = "Network",
+    title: str = "Device vs Network Correlation",
+) -> go.Figure:
+    """
+    Dual-axis chart showing 1+ devices vs network on the same time axis.
+
+    device_frames: list of (label, aligned_df) tuples.
+                   Each aligned_df must have minute_utc, device_coherence,
+                   network_cumsum, envelope_upper, envelope_lower.
+
+    Left Y-axis:  Device Coherence lines (one per device, distinct colors)
     Right Y-axis: Network Cumulative Sum (Red Curve + Blue Envelope)
     """
     from plotly.subplots import make_subplots
 
     fig = make_subplots(specs=[[{"secondary_y": True}]])
 
-    # Device coherence as area fill (left axis)
-    fig.add_trace(
-        go.Scatter(
-            x=aligned_df["minute_utc"],
-            y=aligned_df["device_coherence"],
-            mode="lines",
-            name=f"{device_label} Coherence",
-            line=dict(color="#457B9D", width=1.5),
-            fill="tozeroy",
-            fillcolor="rgba(69, 123, 157, 0.2)",
-        ),
-        secondary_y=False,
-    )
+    # Device coherence lines (left axis) — one per device
+    fill_alphas = [0.15, 0.10, 0.08, 0.06, 0.05]
+    for idx, (label, adf) in enumerate(device_frames):
+        color = MULTI_DEVICE_PALETTE[idx % len(MULTI_DEVICE_PALETTE)]
+        alpha = fill_alphas[idx % len(fill_alphas)]
+        # Parse hex to rgba for fill
+        r, g, b = int(color[1:3], 16), int(color[3:5], 16), int(color[5:7], 16)
 
-    # Network cumsum (right axis) -- Red Curve
+        fig.add_trace(
+            go.Scatter(
+                x=adf["minute_utc"],
+                y=adf["device_coherence"],
+                mode="lines",
+                name=f"{label}",
+                line=dict(color=color, width=1.5),
+                fill="tozeroy",
+                fillcolor=f"rgba({r}, {g}, {b}, {alpha})",
+            ),
+            secondary_y=False,
+        )
+
+    # Use the first aligned_df for network traces (all share the same network data)
+    net_df = device_frames[0][1]
+
+    # Network cumsum (right axis) — Red Curve
     fig.add_trace(
         go.Scatter(
-            x=aligned_df["minute_utc"],
-            y=aligned_df["network_cumsum"],
+            x=net_df["minute_utc"],
+            y=net_df["network_cumsum"],
             mode="lines",
             name=f"{network_label} Cumsum",
             line=dict(color=EVENT_CHART_COLORS["red_curve"], width=LINE_WIDTH_RED_CURVE),
@@ -382,11 +413,11 @@ def correlation_dual_axis_chart(
         secondary_y=True,
     )
 
-    # Network envelope (right axis) -- Blue dashed
+    # Network envelope (right axis) — Blue dashed
     fig.add_trace(
         go.Scatter(
-            x=aligned_df["minute_utc"],
-            y=aligned_df["envelope_upper"],
+            x=net_df["minute_utc"],
+            y=net_df["envelope_upper"],
             mode="lines",
             name="Envelope (95% CI)",
             line=dict(color=EVENT_CHART_COLORS["blue_envelope"], width=1, dash="dash"),
@@ -395,8 +426,8 @@ def correlation_dual_axis_chart(
     )
     fig.add_trace(
         go.Scatter(
-            x=aligned_df["minute_utc"],
-            y=aligned_df["envelope_lower"],
+            x=net_df["minute_utc"],
+            y=net_df["envelope_lower"],
             mode="lines",
             name="Envelope (95% CI)",
             line=dict(color=EVENT_CHART_COLORS["blue_envelope"], width=1, dash="dash"),
