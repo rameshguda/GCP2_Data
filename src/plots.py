@@ -62,6 +62,7 @@ def network_event_analysis_chart(
         y=df["cumulative_coherence"],
         mode="lines",
         name="Cumulative Coherence",
+        showlegend=False,
         line=dict(color=colors["red_curve"], width=LINE_WIDTH_RED_CURVE),
         hovertemplate="Min: %{x:.1f}<br>Coherence: %{y:.2f}<extra></extra>",
     ))
@@ -72,6 +73,7 @@ def network_event_analysis_chart(
         y=df["envelope_upper"],
         mode="lines",
         name="Envelope (95% CI)",
+        showlegend=False,
         line=dict(color=colors["blue_envelope"], width=LINE_WIDTH_BLUE_ENVELOPE),
         hovertemplate="Min: %{x:.1f}<br>Upper: %{y:.2f}<extra></extra>",
     ))
@@ -82,8 +84,8 @@ def network_event_analysis_chart(
         y=df["envelope_lower"],
         mode="lines",
         name="Envelope (95% CI)",
-        line=dict(color=colors["blue_envelope"], width=LINE_WIDTH_BLUE_ENVELOPE),
         showlegend=False,
+        line=dict(color=colors["blue_envelope"], width=LINE_WIDTH_BLUE_ENVELOPE),
         hovertemplate="Min: %{x:.1f}<br>Lower: %{y:.2f}<extra></extra>",
     ))
 
@@ -101,7 +103,7 @@ def network_event_analysis_chart(
         line_width=LINE_WIDTH_EVENT_MARKER,
     )
 
-    # 6. Layout -- match GCP2.net style
+    # 6. Layout -- match GCP2.net ggplot2 style exactly
     subtitle = f"Start time: {start_time_display} {timezone_label}".strip()
     title_text = event_title
     if subtitle:
@@ -111,31 +113,31 @@ def network_event_analysis_chart(
         title=dict(text=title_text, x=0.5, xanchor="center"),
         xaxis=dict(
             title="minutes",
-            zeroline=True,
-            zerolinecolor=colors["zero_baseline"],
-            zerolinewidth=1,
+            zeroline=False,
             gridcolor=colors["grid"],
-            gridwidth=0.5,
+            gridwidth=1,
+            showline=True,
+            linecolor="#000000",
+            linewidth=1,
+            ticks="outside",
+            tickcolor="#000000",
         ),
         yaxis=dict(
             title="Network Coherence (P)",
-            zeroline=True,
-            zerolinecolor=colors["zero_baseline"],
-            zerolinewidth=1,
+            zeroline=False,
             gridcolor=colors["grid"],
-            gridwidth=0.5,
+            gridwidth=1,
+            showline=True,
+            linecolor="#000000",
+            linewidth=1,
+            ticks="outside",
+            tickcolor="#000000",
         ),
         plot_bgcolor=colors["background"],
-        paper_bgcolor=colors["background"],
+        paper_bgcolor="#FFFFFF",
         height=CHART_HEIGHT,
+        showlegend=False,
         hovermode="x unified",
-        legend=dict(
-            orientation="h",
-            yanchor="bottom",
-            y=1.02,
-            xanchor="right",
-            x=1,
-        ),
         font=dict(family="sans-serif"),
     )
 

@@ -55,8 +55,8 @@ EVENT_CHART_COLORS = {
     "blue_envelope": "#0000FF",
     "zero_baseline": "#000000",
     "event_marker":  "#000000",
-    "background":    "#FFFFFF",
-    "grid":          "#E0E0E0",
+    "background":    "#EBEBEB",  # ggplot2 gray -- matches GCP2.net
+    "grid":          "#FFFFFF",  # white gridlines on gray background
 }
 
 # ============================================================
@@ -110,7 +110,7 @@ CHART_EXPORT_SCALE = 2
 LINE_WIDTH_RED_CURVE = 1.5
 LINE_WIDTH_BLUE_ENVELOPE = 1.5
 LINE_WIDTH_ZERO_BASELINE = 1.0
-LINE_WIDTH_EVENT_MARKER = 1.5
+LINE_WIDTH_EVENT_MARKER = 2.5
 LINE_WIDTH_DEVICE = 2.0
 LINE_WIDTH_THRESHOLD = 1.0
 
