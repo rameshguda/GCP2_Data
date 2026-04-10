@@ -1,405 +1,575 @@
-from __future__ import annotations
+"""
+GCP2 Consciousness Data Analyzer
 
-from datetime import time
-from pathlib import Path
+A free, publicly accessible web application for analyzing Random Number Generator
+data from the Global Consciousness Project 2.0 (gcp2.net).
+"""
 
-import pandas as pd
+import datetime
+
 import streamlit as st
 
-from src.demo_data import load_demo_datasets
-from src.device_analysis import device_summary, significance_breakdown
-from src.network_analysis import network_breakdown, network_summary
-from src.parsers import ParsedDataset, parse_uploaded_file
-from src.plots import (
-    device_line_figure,
-    multi_device_figure,
-    network_cumsum_figure,
-    raw_network_figure,
+from src.constants import (
+    DEFAULT_TIMEZONE,
+    MAX_COMPARISON_DEVICES,
+    MAX_DEVICE_UPLOADS,
+    SUPPORTED_TIMEZONES,
 )
-from src.quality import detect_quality_issues
-from src.storage import save_analysis_record
-from src.summaries import build_device_summary_text, build_network_summary_text
-from src.time_utils import filter_by_date_and_time
+from src.correlation_analysis import (
+    align_device_network,
+    correlation_summary,
+    find_concurrent_significance,
+)
+from src.device_analysis import (
+    detect_significant_periods,
+    device_summary,
+    format_significant_periods,
+    significance_breakdown,
+)
+from src.device_config import get_all_devices, get_device_label, set_device_config
+from src.network_analysis import (
+    add_network_metrics,
+    assess_significance,
+    network_breakdown,
+    network_summary,
+)
+from src.parsers import parse_uploaded_file
+from src.plots import (
+    correlation_dual_axis_chart,
+    device_timeline_chart,
+    multi_device_chart,
+    network_event_analysis_chart,
+    raw_network_chart,
+)
+from src.reports import (
+    generate_correlation_report_pdf,
+    generate_correlation_report_text,
+    generate_device_report_pdf,
+    generate_device_report_text,
+    generate_network_report_pdf,
+    generate_network_report_text,
+)
+from src.time_utils import (
+    compute_relative_minutes,
+    filter_by_date_range,
+    filter_by_time_range,
+    localize_for_display,
+)
 
-st.set_page_config(page_title="GCP2 Data Analysis App", layout="wide")
+# ── Page Config ──────────────────────────────────────────────
 
-ANALYSIS_DIR = Path("saved_analyses")
+st.set_page_config(
+    page_title="GCP2 Consciousness Data Analyzer",
+    page_icon="🔮",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
 
+# ── Session State ────────────────────────────────────────────
 
-def figure_download_bytes(figure) -> bytes | None:
-    try:
-        return figure.to_image(format="png")
-    except Exception:
-        return None
-
-
-def render_dataset_overview(dataset: ParsedDataset) -> None:
-    df = dataset.dataframe
-    st.write(f"Type: `{dataset.data_type}`")
-    st.write(f"Rows: `{len(df):,}`")
-    st.write(f"UTC range: `{df['datetime_utc'].min()}` to `{df['datetime_utc'].max()}`")
-    if dataset.device_id:
-        st.write(f"Device ID: `{dataset.device_id}`")
-    if dataset.group_name:
-        st.write(f"Group: `{dataset.group_name}`")
+if "device_datasets" not in st.session_state:
+    st.session_state["device_datasets"] = {}
+if "network_datasets" not in st.session_state:
+    st.session_state["network_datasets"] = {}
 
 
-def show_quality_issues(dataset: ParsedDataset) -> None:
-    issues = detect_quality_issues(dataset.dataframe, dataset.data_type)
-    for issue in issues:
-        st.warning(issue, icon="!")
+# ── Helpers ──────────────────────────────────────────────────
 
-
-def dataset_option_label(dataset: ParsedDataset) -> str:
-    return f"{dataset.source_label} ({dataset.data_type})"
-
-
-def render_summary_metrics(label: str, summary: dict[str, object], data_type: str) -> None:
-    if data_type == "device":
-        col1, col2, col3, col4 = st.columns(4)
-        col1.metric("Rows", f"{summary['rows']:,}")
-        col2.metric("Mean coherence", f"{summary['mean_coherence']:.2f}" if summary["mean_coherence"] is not None else "-")
-        col3.metric("Max coherence", f"{summary['max_coherence']:.2f}" if summary["max_coherence"] is not None else "-")
-        col4.metric("Coverage", f"{summary['coverage_pct']:.1f}%" if summary["coverage_pct"] is not None else "-")
-    else:
-        col1, col2, col3, col4 = st.columns(4)
-        col1.metric("Rows", f"{summary['rows']:,}")
-        col2.metric("Mean coherence", f"{summary['mean_coherence']:.4f}" if summary["mean_coherence"] is not None else "-")
-        col3.metric("Max |cumsum|", f"{summary['max_abs_cumsum']:.2f}" if summary["max_abs_cumsum"] is not None else "-")
-        col4.metric(
-            "Avg active devices",
-            f"{summary['active_devices_mean']:.1f}" if summary["active_devices_mean"] is not None else "-",
-        )
-
-
-def build_uploaded_datasets(uploaded_files) -> tuple[list[ParsedDataset], list[str]]:
-    datasets: list[ParsedDataset] = []
-    errors: list[str] = []
-    for uploaded in uploaded_files:
+def _handle_upload(files) -> None:
+    for f in files:
         try:
-            datasets.append(parse_uploaded_file(uploaded.getvalue(), uploaded.name))
-        except Exception as exc:
-            errors.append(f"{uploaded.name}: {exc}")
-    return datasets, errors
+            parsed = parse_uploaded_file(f.read(), f.name)
+            if parsed.dataset_type == "device":
+                label = get_device_label(parsed.device_id) if parsed.device_id else f.name
+                st.session_state["device_datasets"][label] = parsed
+            elif parsed.dataset_type == "network":
+                label = parsed.group_name or f.name
+                st.session_state["network_datasets"][label] = parsed
+        except Exception as e:
+            st.error(f"Error processing **{f.name}**: {e}")
 
 
-def main() -> None:
-    st.title("GCP2 Data Analysis App")
-    st.caption(
-        "Upload GCP 2.0 Device Coherence or Network Coherence CSV files, "
-        "filter by time window, compare datasets, and export charts."
-    )
-    st.info(
-        "This app is designed for public sharing: users open the link, upload their own CSV files, "
-        "and run the analysis directly in the browser."
-    )
+def _apply_filters(df, tz, dr, tf):
+    df = localize_for_display(df, tz)
+    if dr and len(dr) == 2:
+        df = filter_by_date_range(df, dr[0], dr[1], tz)
+    if tf:
+        df = filter_by_time_range(df, tf[0], tf[1])
+    return df
 
-    with st.expander("How To Use This App", expanded=False):
-        guide_tab, device_tab, network_tab, privacy_tab = st.tabs(
-            ["Quick Start", "Device Data", "Network Data", "Public App Notes"]
-        )
-        with guide_tab:
-            st.markdown(
-                """
-                1. Upload one or more GCP2 CSV or ZIP files
-                2. Choose your display timezone and date/time filters
-                3. Review the detected dataset type and date coverage
-                4. Explore the charts and breakdown tabs
-                5. Export PNG or filtered CSV when needed
-                6. Save analysis metadata for future reference
-                """
-            )
-        with device_tab:
-            st.markdown(
-                """
-                Device files should include:
-                - `device_number`
-                - `epoch_time_utc`
-                - `active_seconds`
-                - `device_coherence`
-                - `significance`
 
-                The app will:
-                - recognize the device ID
-                - chart device coherence over time
-                - show significance breakdowns
-                - flag reduced coverage when `active_seconds` is below `3600`
-                """
-            )
-        with network_tab:
-            st.markdown(
-                """
-                Network files should include:
-                - `epoch_time_utc`
-                - `network_coherence`
-                - `active_devices`
+def _date_range_str(df, tz_name):
+    if df.empty:
+        return ""
+    col = "datetime_display" if "datetime_display" in df.columns else "datetime_utc"
+    return f"{df[col].iloc[0].strftime('%Y-%m-%d %H:%M')} to {df[col].iloc[-1].strftime('%Y-%m-%d %H:%M')} {tz_name}"
 
-                The app will:
-                - plot raw network coherence
-                - plot cumulative network coherence
-                - show an envelope view based on the current implementation
-                - summarize positive and negative coherence values
-                """
-            )
-        with privacy_tab:
-            st.markdown(
-                """
-                This app is intended to be publicly accessible by link.
 
-                Important:
-                - the GitHub repository holds the source code
-                - the deployed Streamlit URL is the app your users will open
-                - anyone with the deployed app link can use it if the deployment is public
-                - uploaded data should be treated carefully before public deployment
-                """
-            )
-    use_demo_data = st.toggle("Use bundled demo data", value=False)
+# ── Sidebar ──────────────────────────────────────────────────
 
+with st.sidebar:
+    st.title("GCP2 Analyzer")
+    st.caption("Consciousness Data Analysis Tool")
+    st.divider()
+
+    # Upload
+    st.subheader("Upload Data")
     uploaded_files = st.file_uploader(
-        "Upload one or more GCP2 CSV files",
+        "Upload CSV or ZIP files from gcp2.net",
         type=["csv", "zip"],
         accept_multiple_files=True,
+        help=f"Device Coherence and/or Network Coherence (max {MAX_DEVICE_UPLOADS})",
     )
-
-    datasets: list[ParsedDataset] = []
-    errors: list[str] = []
-    if use_demo_data:
-        datasets.extend(load_demo_datasets())
     if uploaded_files:
-        uploaded_datasets, upload_errors = build_uploaded_datasets(uploaded_files)
-        datasets.extend(uploaded_datasets)
-        errors.extend(upload_errors)
+        _handle_upload(uploaded_files)
 
-    if not datasets:
-        st.info("Upload at least one GCP2 CSV or ZIP file to begin.")
-        return
+    device_count = len(st.session_state["device_datasets"])
+    network_count = len(st.session_state["network_datasets"])
 
-    for error in errors:
-        st.error(error)
-
-    with st.expander("Detected files", expanded=True):
-        for dataset in datasets:
-            st.subheader(dataset.file_name)
-            render_dataset_overview(dataset)
-
-    all_dates = pd.concat([dataset.dataframe["datetime_utc"] for dataset in datasets])
-    min_date = all_dates.min().date()
-    max_date = all_dates.max().date()
-
-    st.sidebar.header("Analysis Controls")
-    analysis_mode = st.sidebar.radio(
-        "Analysis mode",
-        options=["All uploaded data", "Device only", "Network only"],
-        index=0,
-    )
-    timezone_name = st.sidebar.selectbox(
-        "Display timezone",
-        options=[
-            "UTC",
-            "Asia/Kolkata",
-            "America/New_York",
-            "America/Los_Angeles",
-            "Europe/London",
-        ],
-        index=0,
-    )
-    start_date, end_date = st.sidebar.date_input(
-        "Date range",
-        value=(min_date, max_date),
-        min_value=min_date,
-        max_value=max_date,
-    )
-    start_clock = st.sidebar.time_input("Start time", value=time(0, 0))
-    end_clock = st.sidebar.time_input("End time", value=time(23, 59))
-
-    st.sidebar.caption("All calculations remain UTC-based. Timezone selection changes display only.")
-
-    filtered_datasets: list[ParsedDataset] = []
-    for dataset in datasets:
-        filtered = filter_by_date_and_time(
-            dataset.dataframe,
-            timezone_name=timezone_name,
-            start_date=start_date,
-            end_date=end_date,
-            start_time=start_clock,
-            end_time=end_clock,
-        )
-        filtered_datasets.append(
-            ParsedDataset(
-                file_name=dataset.file_name,
-                data_type=dataset.data_type,
-                dataframe=filtered,
-                source_label=dataset.source_label,
-                device_id=dataset.device_id,
-                group_name=dataset.group_name,
-            )
-        )
-
-    device_sets = [dataset for dataset in filtered_datasets if dataset.data_type == "device"]
-    network_sets = [dataset for dataset in filtered_datasets if dataset.data_type == "network"]
-
-    if analysis_mode == "Device only":
-        network_sets = []
-    elif analysis_mode == "Network only":
-        device_sets = []
-
-    selected_device_labels = []
-    if len(device_sets) > 1:
-        selected_device_labels = st.sidebar.multiselect(
-            "Devices to compare",
-            options=[dataset_option_label(dataset) for dataset in device_sets],
-            default=[dataset_option_label(dataset) for dataset in device_sets[:4]],
-        )
-        selected_map = {dataset_option_label(dataset): dataset for dataset in device_sets}
-        device_sets = [selected_map[label] for label in selected_device_labels][:4]
-    else:
-        device_sets = device_sets[:4]
-
-    selected_network_labels = []
-    if len(network_sets) > 1:
-        selected_network_labels = st.sidebar.multiselect(
-            "Network datasets to show",
-            options=[dataset_option_label(dataset) for dataset in network_sets],
-            default=[dataset_option_label(dataset) for dataset in network_sets],
-        )
-        selected_map = {dataset_option_label(dataset): dataset for dataset in network_sets}
-        network_sets = [selected_map[label] for label in selected_network_labels]
-
-    overview_col1, overview_col2, overview_col3 = st.columns(3)
-    overview_col1.metric("Uploaded files", len(datasets))
-    overview_col2.metric("Device datasets", len([d for d in filtered_datasets if d.data_type == "device"]))
-    overview_col3.metric("Network datasets", len([d for d in filtered_datasets if d.data_type == "network"]))
-
-    with st.expander("Current Analysis Window", expanded=False):
-        st.write(f"Display timezone: `{timezone_name}`")
-        st.write(f"Date range: `{start_date}` to `{end_date}`")
-        st.write(f"Time range: `{start_clock.isoformat()}` to `{end_clock.isoformat()}`")
-        st.write(f"Analysis mode: `{analysis_mode}`")
-
-    if device_sets:
-        st.header("Device Coherence")
-        for dataset in device_sets:
-            st.subheader(dataset.source_label)
-            show_quality_issues(dataset)
-            summary = device_summary(dataset.dataframe)
-            render_summary_metrics(dataset.source_label, summary, "device")
-            st.write(build_device_summary_text(dataset.source_label, summary))
-            detail_tab, breakdown_tab, export_tab = st.tabs(["Chart", "Breakdown", "Export"])
-            with detail_tab:
-                fig = device_line_figure(dataset.dataframe, f"{dataset.source_label} Device Coherence")
-                st.plotly_chart(fig, use_container_width=True)
-            with breakdown_tab:
-                breakdown = significance_breakdown(dataset.dataframe)
-                st.dataframe(breakdown, use_container_width=True, hide_index=True)
-            with export_tab:
-                export_col1, export_col2 = st.columns(2)
-                export_col1.download_button(
-                    "Download filtered CSV",
-                    dataset.dataframe.to_csv(index=False).encode("utf-8"),
-                    file_name=f"{dataset.source_label.replace(' ', '_').lower()}_filtered.csv",
-                    mime="text/csv",
-                )
-                image_bytes = figure_download_bytes(fig)
-                if image_bytes:
-                    export_col2.download_button(
-                        "Download PNG",
-                        image_bytes,
-                        file_name=f"{dataset.source_label.replace(' ', '_').lower()}.png",
-                        mime="image/png",
-                    )
-
-        if len(device_sets) > 1:
-            comparison = [(dataset.source_label, dataset.dataframe) for dataset in device_sets]
-            st.subheader("Multi-Device Comparison")
-            compare_fig = multi_device_figure(comparison)
-            st.plotly_chart(compare_fig, use_container_width=True)
-
-    if network_sets:
-        st.header("Network Coherence")
-        for dataset in network_sets:
-            st.subheader(dataset.source_label)
-            show_quality_issues(dataset)
-            summary = network_summary(dataset.dataframe)
-            breakdown = network_breakdown(dataset.dataframe)
-            render_summary_metrics(dataset.source_label, summary, "network")
-            st.write(build_network_summary_text(dataset.source_label, summary))
-            detail_tab, stats_tab, export_tab = st.tabs(["Charts", "Breakdown", "Export"])
-            with detail_tab:
-                raw_fig = raw_network_figure(dataset.dataframe, f"{dataset.source_label} Raw Network Coherence")
-                cumsum_fig = network_cumsum_figure(
-                    dataset.dataframe,
-                    f"{dataset.source_label} Cumulative Network Coherence",
-                )
-                st.plotly_chart(raw_fig, use_container_width=True)
-                st.plotly_chart(cumsum_fig, use_container_width=True)
-            with stats_tab:
-                col1, col2, col3, col4 = st.columns(4)
-                col1.metric("Positive rows", f"{breakdown['positive_rows']:,}")
-                col2.metric("Negative rows", f"{breakdown['negative_rows']:,}")
-                col3.metric(
-                    "Largest positive",
-                    f"{breakdown['largest_positive']:.4f}" if breakdown["largest_positive"] is not None else "-",
-                )
-                col4.metric(
-                    "Largest negative",
-                    f"{breakdown['largest_negative']:.4f}" if breakdown["largest_negative"] is not None else "-",
-                )
-            with export_tab:
-                export_col1, export_col2 = st.columns(2)
-                export_col1.download_button(
-                    "Download filtered CSV",
-                    dataset.dataframe.to_csv(index=False).encode("utf-8"),
-                    file_name=f"{dataset.source_label.replace(' ', '_').lower()}_filtered.csv",
-                    mime="text/csv",
-                    key=f"{dataset.file_name}_csv",
-                )
-                image_bytes = figure_download_bytes(cumsum_fig)
-                if image_bytes:
-                    export_col2.download_button(
-                        "Download PNG",
-                        image_bytes,
-                        file_name=f"{dataset.source_label.replace(' ', '_').lower()}_cumsum.png",
-                        mime="image/png",
-                        key=f"{dataset.file_name}_png",
-                    )
-
-    st.header("Save Analysis")
-    with st.form("save-analysis"):
-        title = st.text_input("Analysis title")
-        event_name = st.text_input("Event or study name")
-        event_context = st.text_input("Context or location")
-        notes = st.text_area("Notes")
-        submitted = st.form_submit_button("Save analysis metadata")
-        if submitted:
-            payload = {
-                "title": title,
-                "event_name": event_name,
-                "event_context": event_context,
-                "notes": notes,
-                "timezone": timezone_name,
-                "analysis_mode": analysis_mode,
-                "date_range": [str(start_date), str(end_date)],
-                "time_range": [start_clock.isoformat(), end_clock.isoformat()],
-                "datasets": [
-                    {
-                        "file_name": dataset.file_name,
-                        "type": dataset.data_type,
-                        "source_label": dataset.source_label,
-                        "rows_after_filter": int(len(dataset.dataframe)),
-                        "quality_issues": detect_quality_issues(dataset.dataframe, dataset.data_type),
-                    }
-                    for dataset in filtered_datasets
-                ],
-            }
-            target = save_analysis_record(ANALYSIS_DIR, payload)
-            st.success(f"Saved analysis metadata to {target}")
+    if device_count > 0 or network_count > 0:
+        st.divider()
+        st.subheader("Loaded Files")
+        if device_count > 0:
+            st.markdown("**Devices:**")
+            for label, ds in st.session_state["device_datasets"].items():
+                st.markdown(f"- {label} ({ds.row_count:,} rows)")
+        if network_count > 0:
+            st.markdown("**Network:**")
+            for label, ds in st.session_state["network_datasets"].items():
+                st.markdown(f"- {label} ({ds.row_count:,} rows)")
+        if st.button("Clear All Data"):
+            st.session_state["device_datasets"] = {}
+            st.session_state["network_datasets"] = {}
+            st.rerun()
 
     st.divider()
-    st.caption(
-        "Public deployment target: GitHub repository + Streamlit Community Cloud. "
-        "Users will open the deployed app link, not the GitHub code link."
-    )
+    st.subheader("Settings")
+    timezone = st.selectbox("Display Timezone", SUPPORTED_TIMEZONES, index=SUPPORTED_TIMEZONES.index(DEFAULT_TIMEZONE))
+
+    date_range = None
+    time_filter = None
+
+    if device_count > 0 or network_count > 0:
+        st.divider()
+        st.subheader("Filters")
+        all_dates = []
+        for ds in list(st.session_state["device_datasets"].values()) + list(st.session_state["network_datasets"].values()):
+            if ds.date_min:
+                all_dates.append(ds.date_min)
+            if ds.date_max:
+                all_dates.append(ds.date_max)
+        if all_dates:
+            overall_min = min(all_dates).date()
+            overall_max = max(all_dates).date()
+            date_range = st.date_input("Date Range", value=(overall_min, overall_max), min_value=overall_min, max_value=overall_max)
+        use_time = st.checkbox("Filter by time of day")
+        if use_time:
+            start_time = st.time_input("Start time", datetime.time(0, 0))
+            end_time = st.time_input("End time", datetime.time(23, 59))
+            time_filter = (start_time, end_time)
+
+    st.divider()
+    st.subheader("Device Names")
+    existing_devices = get_all_devices()
+    if existing_devices:
+        for did, info in existing_devices.items():
+            st.text(f"Device {did}: {info.get('name', '—')}")
+    with st.expander("Add / Edit Device Name"):
+        new_id = st.number_input("Device ID", min_value=1, step=1, value=15)
+        new_name = st.text_input("Name", placeholder="e.g., Lab1")
+        new_loc = st.text_input("Location", placeholder="e.g., California")
+        if st.button("Save Name") and new_name:
+            set_device_config(int(new_id), new_name, new_loc)
+            st.success(f"Saved: Device {new_id} = {new_name}")
+            st.rerun()
 
 
-if __name__ == "__main__":
-    main()
+# ── Main Content ─────────────────────────────────────────────
+
+has_data = device_count > 0 or network_count > 0
+
+if not has_data:
+    st.title("GCP2 Consciousness Data Analyzer")
+    st.markdown("---")
+    col1, col2 = st.columns(2)
+    with col1:
+        st.markdown("""
+### Welcome
+
+This tool analyzes RNG data from the **Global Consciousness Project 2.0**.
+
+**Getting Started:**
+1. Go to [gcp2.net](https://gcp2.net) > Data & Results > Data Download
+2. Download **Device Coherence** CSV for your device(s)
+3. Download **Network Coherence** CSV for the time period to analyze
+4. Upload the files using the sidebar
+
+**What This Tool Can Do:**
+- Analyze device coherence and identify significant periods
+- Generate Event Analysis charts (Red Curve + Blue Envelope)
+- Compare multiple devices side by side
+- Correlate device activity with network coherence
+- Generate detailed PDF reports and export charts
+        """)
+    with col2:
+        st.markdown("""
+### About the Data
+
+GCP 2.0 collects quantum random data from **NextGen RNG devices**
+hosted by citizen scientists worldwide.
+
+**Device Coherence** measures whether RNGs inside a single device
+are synchronizing beyond what chance allows.
+
+**Network Coherence** measures whether devices across the global
+network are synchronizing -- potentially reflecting shared human
+consciousness.
+
+When the **Red Curve** exits the **Blue Envelope**, the network
+is behaving in a way that would happen less than 5% of the time
+by pure chance (p < 0.05).
+        """)
+    st.info("Upload CSV files from gcp2.net using the sidebar to begin.")
+
+else:
+    st.title("GCP2 Consciousness Data Analyzer")
+
+    # Warnings
+    for label, ds in {**st.session_state["device_datasets"], **st.session_state["network_datasets"]}.items():
+        for w in ds.warnings:
+            st.warning(f"**{label}:** {w}")
+
+    # Build tabs
+    tab_names = []
+    if device_count > 0:
+        tab_names.append("Device Analysis")
+    if network_count > 0:
+        tab_names.append("Network Analysis")
+    if device_count > 0 and network_count > 0:
+        tab_names.append("Correlation")
+
+    tabs = st.tabs(tab_names)
+    tab_idx = 0
+
+    # ══════════════════════════════════════════════════════════
+    # DEVICE ANALYSIS TAB
+    # ══════════════════════════════════════════════════════════
+    if device_count > 0:
+        with tabs[tab_idx]:
+            st.header("Device Coherence Analysis")
+
+            for label, ds in st.session_state["device_datasets"].items():
+                st.subheader(label)
+                filtered = _apply_filters(ds.df, timezone, date_range, time_filter)
+
+                if filtered.empty:
+                    st.warning("No data in the selected range.")
+                    continue
+
+                summary = device_summary(filtered)
+                c1, c2, c3, c4, c5 = st.columns(5)
+                c1.metric("Rows", f"{summary['rows']:,}")
+                c2.metric("Mean", f"{summary['mean_coherence']}")
+                c3.metric("Max", f"{summary['max_coherence']} ({summary['max_significance']})")
+                c4.metric("Elevated+", f"{summary['elevated_rows']:,}")
+                c5.metric("Coverage", f"{summary['coverage_pct']}%")
+
+                dev_tabs = st.tabs(["Timeline Chart", "Significance", "Significant Periods", "Report"])
+
+                # ── Timeline Chart ───────────────────────────
+                with dev_tabs[0]:
+                    use_led = st.checkbox("LED colors (hardware match)", value=True, key=f"led_{label}")
+                    fig = device_timeline_chart(filtered, title=label, use_led_colors=use_led)
+                    st.plotly_chart(fig, use_container_width=True)
+
+                    ca, cb = st.columns(2)
+                    with ca:
+                        png = fig.to_image(format="png", width=1600, height=900, scale=2)
+                        st.download_button("Download Chart (PNG)", data=png,
+                            file_name=f"GCP2_{label.replace(' ', '_')}_chart.png",
+                            mime="image/png", key=f"dpng_{label}")
+                    with cb:
+                        csv = filtered.to_csv(index=False).encode("utf-8")
+                        st.download_button("Download Data (CSV)", data=csv,
+                            file_name=f"GCP2_{label.replace(' ', '_')}_data.csv",
+                            mime="text/csv", key=f"dcsv_{label}")
+
+                # ── Significance Breakdown ────────────────────
+                with dev_tabs[1]:
+                    bd = significance_breakdown(filtered)
+                    st.dataframe(bd, use_container_width=True, hide_index=True)
+
+                # ── Significant Periods ───────────────────────
+                with dev_tabs[2]:
+                    periods = detect_significant_periods(filtered)
+                    if periods:
+                        st.text(format_significant_periods(periods))
+                    else:
+                        st.info("No periods of elevated significance in this range.")
+
+                # ── Report Generation ─────────────────────────
+                with dev_tabs[3]:
+                    bd = significance_breakdown(filtered)
+                    periods = detect_significant_periods(filtered)
+                    dr_str = _date_range_str(filtered, timezone)
+
+                    report_text = generate_device_report_text(
+                        label, summary, bd, periods, dr_str, timezone
+                    )
+                    st.text_area("Report Preview", report_text, height=400, key=f"drpt_{label}")
+
+                    rca, rcb = st.columns(2)
+                    with rca:
+                        st.download_button("Download Report (TXT)", data=report_text,
+                            file_name=f"GCP2_{label.replace(' ', '_')}_report.txt",
+                            mime="text/plain", key=f"dtxt_{label}")
+                    with rcb:
+                        chart_png = fig.to_image(format="png", width=1600, height=900, scale=2)
+                        pdf_bytes = generate_device_report_pdf(
+                            label, summary, bd, periods, dr_str, timezone, chart_png
+                        )
+                        st.download_button("Download Report (PDF)", data=pdf_bytes,
+                            file_name=f"GCP2_{label.replace(' ', '_')}_report.pdf",
+                            mime="application/pdf", key=f"dpdf_{label}")
+
+                st.divider()
+
+            # Multi-device comparison
+            if device_count >= 2:
+                st.subheader("Multi-Device Comparison")
+                selected = st.multiselect(
+                    "Select devices to compare",
+                    list(st.session_state["device_datasets"].keys()),
+                    default=list(st.session_state["device_datasets"].keys())[:MAX_COMPARISON_DEVICES],
+                    max_selections=MAX_COMPARISON_DEVICES,
+                )
+                if len(selected) >= 2:
+                    frames = [(lbl, _apply_filters(st.session_state["device_datasets"][lbl].df, timezone, date_range, time_filter)) for lbl in selected]
+                    fig = multi_device_chart(frames)
+                    st.plotly_chart(fig, use_container_width=True)
+                    png = fig.to_image(format="png", width=1600, height=900, scale=2)
+                    st.download_button("Download Comparison (PNG)", data=png,
+                        file_name="GCP2_MultiDevice_Comparison.png", mime="image/png")
+
+        tab_idx += 1
+
+    # ══════════════════════════════════════════════════════════
+    # NETWORK ANALYSIS TAB
+    # ══════════════════════════════════════════════════════════
+    if network_count > 0:
+        with tabs[tab_idx]:
+            st.header("Network Coherence Analysis")
+
+            for label, ds in st.session_state["network_datasets"].items():
+                st.subheader(label)
+                filtered = _apply_filters(ds.df, timezone, date_range, time_filter)
+
+                if filtered.empty:
+                    st.warning("No data in the selected range.")
+                    continue
+
+                st.markdown(f"**{len(filtered):,}** data points ({len(filtered)/60:.0f} minutes)")
+
+                # Event metadata
+                st.markdown("#### Event Details")
+                ec1, ec2 = st.columns(2)
+                with ec1:
+                    event_title = st.text_input("Event Title", value="Event Analysis", key=f"et_{label}")
+                with ec2:
+                    event_start_str = st.text_input("Event Start (optional)", placeholder="YYYY-MM-DD HH:MM:SS", key=f"es_{label}")
+
+                # Determine start epoch
+                if event_start_str:
+                    try:
+                        import pytz
+                        tz = pytz.timezone(timezone)
+                        naive = datetime.datetime.strptime(event_start_str, "%Y-%m-%d %H:%M:%S")
+                        event_start_epoch = int(tz.localize(naive).timestamp())
+                    except Exception:
+                        st.warning("Could not parse start time. Using first data point.")
+                        event_start_epoch = int(filtered["epoch_time_utc"].iloc[0])
+                else:
+                    event_start_epoch = int(filtered["epoch_time_utc"].iloc[0])
+
+                # Compute metrics
+                metrics_df = add_network_metrics(filtered)
+                metrics_df = compute_relative_minutes(metrics_df, event_start_epoch)
+
+                start_display = filtered["datetime_display"].iloc[0].strftime("%Y-%m-%d %H:%M:%S")
+                tz_abbrev = filtered["datetime_display"].iloc[0].strftime("%Z")
+
+                net_tabs = st.tabs(["Event Analysis Chart", "Raw Coherence", "Summary & Assessment", "Report"])
+
+                # ── Event Analysis Chart ──────────────────────
+                with net_tabs[0]:
+                    fig = network_event_analysis_chart(metrics_df, event_title, start_display, tz_abbrev)
+                    st.plotly_chart(fig, use_container_width=True)
+
+                    na, nb = st.columns(2)
+                    with na:
+                        png = fig.to_image(format="png", width=1600, height=900, scale=2)
+                        st.download_button("Download Chart (PNG)", data=png,
+                            file_name=f"GCP2_EventAnalysis_{event_title.replace(' ', '_')}.png",
+                            mime="image/png", key=f"npng_{label}")
+                    with nb:
+                        csv = metrics_df.to_csv(index=False).encode("utf-8")
+                        st.download_button("Download Data (CSV)", data=csv,
+                            file_name=f"GCP2_Network_{label.replace(' ', '_')}_analysis.csv",
+                            mime="text/csv", key=f"ncsv_{label}")
+
+                # ── Raw Coherence ─────────────────────────────
+                with net_tabs[1]:
+                    fig_raw = raw_network_chart(filtered, title=f"{label} - Raw Coherence")
+                    st.plotly_chart(fig_raw, use_container_width=True)
+
+                # ── Summary & Assessment ──────────────────────
+                with net_tabs[2]:
+                    ns = network_summary(metrics_df)
+
+                    c1, c2, c3, c4 = st.columns(4)
+                    c1.metric("Duration", f"{ns['duration_minutes']} min")
+                    c2.metric("Final Cumsum", f"{ns['final_cumsum']:+.1f}" if ns['final_cumsum'] is not None else "—")
+                    c3.metric("Peak Cumsum", f"{ns['peak_cumsum']:+.1f}" if ns['peak_cumsum'] is not None else "—")
+                    c4.metric("Active Devices", ns['active_devices_range'] or "—")
+
+                    st.markdown("#### Significance Assessment")
+                    assessment = assess_significance(ns)
+                    if ns.get("envelope_exit"):
+                        st.success(assessment)
+                    else:
+                        st.info(assessment)
+
+                    st.markdown("#### Coherence Breakdown")
+                    bd = network_breakdown(filtered)
+                    bc1, bc2, bc3 = st.columns(3)
+                    bc1.metric("Positive Rows", f"{bd['positive_rows']:,}")
+                    bc2.metric("Negative Rows", f"{bd['negative_rows']:,}")
+                    bc3.metric("Largest (+/-)",
+                        f"+{bd['largest_positive']:.4f} / {bd['largest_negative']:.4f}" if bd['largest_positive'] is not None else "—")
+
+                # ── Report ────────────────────────────────────
+                with net_tabs[3]:
+                    ns = network_summary(metrics_df)
+                    assessment = assess_significance(ns)
+                    dr_str = _date_range_str(filtered, timezone)
+
+                    report_text = generate_network_report_text(
+                        label, ns, assessment, event_title, dr_str, timezone
+                    )
+                    st.text_area("Report Preview", report_text, height=400, key=f"nrpt_{label}")
+
+                    ra, rb = st.columns(2)
+                    with ra:
+                        st.download_button("Download Report (TXT)", data=report_text,
+                            file_name=f"GCP2_Network_{label.replace(' ', '_')}_report.txt",
+                            mime="text/plain", key=f"ntxt_{label}")
+                    with rb:
+                        chart_png = fig.to_image(format="png", width=1600, height=900, scale=2)
+                        pdf_bytes = generate_network_report_pdf(
+                            label, ns, assessment, event_title, dr_str, timezone, chart_png
+                        )
+                        st.download_button("Download Report (PDF)", data=pdf_bytes,
+                            file_name=f"GCP2_Network_{label.replace(' ', '_')}_report.pdf",
+                            mime="application/pdf", key=f"npdf_{label}")
+
+                st.divider()
+
+        tab_idx += 1
+
+    # ══════════════════════════════════════════════════════════
+    # CORRELATION TAB
+    # ══════════════════════════════════════════════════════════
+    if device_count > 0 and network_count > 0:
+        with tabs[tab_idx]:
+            st.header("Device-Network Correlation")
+
+            # Select which device and network to correlate
+            dev_labels = list(st.session_state["device_datasets"].keys())
+            net_labels = list(st.session_state["network_datasets"].keys())
+
+            cc1, cc2 = st.columns(2)
+            with cc1:
+                sel_device = st.selectbox("Select Device", dev_labels, key="corr_dev")
+            with cc2:
+                sel_network = st.selectbox("Select Network", net_labels, key="corr_net")
+
+            dev_ds = st.session_state["device_datasets"][sel_device]
+            net_ds = st.session_state["network_datasets"][sel_network]
+
+            dev_filtered = _apply_filters(dev_ds.df, timezone, date_range, time_filter)
+            net_filtered = _apply_filters(net_ds.df, timezone, date_range, time_filter)
+
+            if dev_filtered.empty or net_filtered.empty:
+                st.warning("One or both datasets have no data in the selected range.")
+            else:
+                # Align data
+                aligned = align_device_network(dev_filtered, net_filtered)
+
+                if aligned.empty:
+                    st.warning("No overlapping time range between the selected device and network data. Check your date filters.")
+                else:
+                    st.markdown(f"**{len(aligned)}** overlapping minutes found.")
+
+                    # Concurrent significance
+                    concurrent = find_concurrent_significance(aligned)
+                    corr_sum = correlation_summary(aligned, concurrent, sel_device, sel_network)
+
+                    # Summary metrics
+                    mc1, mc2, mc3, mc4 = st.columns(4)
+                    mc1.metric("Overlap", f"{corr_sum['overlap_minutes']} min")
+                    mc2.metric("Device Elevated+", f"{corr_sum['device_elevated_minutes']} min")
+                    mc3.metric("Network Significant", f"{corr_sum['network_significant_minutes']} min")
+                    mc4.metric("Concurrent", f"{corr_sum['concurrent_minutes']} min ({corr_sum['period_count']} windows)")
+
+                    corr_tabs = st.tabs(["Correlation Chart", "Concurrent Periods", "Report"])
+
+                    # ── Correlation Chart ─────────────────────
+                    with corr_tabs[0]:
+                        fig = correlation_dual_axis_chart(aligned, sel_device, sel_network)
+                        st.plotly_chart(fig, use_container_width=True)
+
+                        ca, cb = st.columns(2)
+                        with ca:
+                            png = fig.to_image(format="png", width=1600, height=900, scale=2)
+                            st.download_button("Download Chart (PNG)", data=png,
+                                file_name="GCP2_Correlation_Chart.png",
+                                mime="image/png", key="corr_png")
+                        with cb:
+                            csv = aligned.to_csv(index=False).encode("utf-8")
+                            st.download_button("Download Aligned Data (CSV)", data=csv,
+                                file_name="GCP2_Correlation_Data.csv",
+                                mime="text/csv", key="corr_csv")
+
+                    # ── Concurrent Periods ────────────────────
+                    with corr_tabs[1]:
+                        if concurrent:
+                            for i, p in enumerate(concurrent[:10], 1):
+                                st.markdown(
+                                    f"**{i}. {p['start_time']} to {p['end_time']}** ({p['duration_minutes']} min)\n\n"
+                                    f"- Device peak: {p['device_peak']} ({p['device_peak_significance']})\n"
+                                    f"- Network cumsum: {p['network_cumsum_peak']:+.1f} ({p['network_direction']})"
+                                )
+                        else:
+                            st.info("No periods of simultaneous device + network significance found in this range.")
+
+                    # ── Report ────────────────────────────────
+                    with corr_tabs[2]:
+                        dr_str = _date_range_str(dev_filtered, timezone)
+                        report_text = generate_correlation_report_text(
+                            corr_sum, concurrent, dr_str, timezone
+                        )
+                        st.text_area("Report Preview", report_text, height=400, key="corr_rpt")
+
+                        ra, rb = st.columns(2)
+                        with ra:
+                            st.download_button("Download Report (TXT)", data=report_text,
+                                file_name="GCP2_Correlation_Report.txt",
+                                mime="text/plain", key="corr_txt")
+                        with rb:
+                            chart_png = fig.to_image(format="png", width=1600, height=900, scale=2)
+                            pdf_bytes = generate_correlation_report_pdf(
+                                corr_sum, concurrent, dr_str, timezone, chart_png
+                            )
+                            st.download_button("Download Report (PDF)", data=pdf_bytes,
+                                file_name="GCP2_Correlation_Report.pdf",
+                                mime="application/pdf", key="corr_pdf")

@@ -9,3 +9,5 @@ __pycache__/
 .pytest_cache/
 .venv/
 saved_analyses/
+device_config.json
+.claude/

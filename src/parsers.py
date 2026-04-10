@@ -1,115 +1,221 @@
+"""
+CSV file detection, validation, and normalization.
+
+Handles both Device Coherence and Network Coherence CSV files
+downloaded from gcp2.net. Supports .csv and .zip uploads.
+"""
+
 from __future__ import annotations
 
-from dataclasses import dataclass
-from pathlib import Path
 import io
 import re
 import zipfile
+from dataclasses import dataclass, field
 
 import pandas as pd
 
-DEVICE_REQUIRED_COLUMNS = {
-    "device_number",
-    "epoch_time_utc",
-    "active_seconds",
-    "device_coherence",
-    "significance",
-}
-
-NETWORK_REQUIRED_COLUMNS = {
-    "epoch_time_utc",
-    "network_coherence",
-    "active_devices",
-}
+from src.constants import DEVICE_REQUIRED_COLUMNS, NETWORK_REQUIRED_COLUMNS
 
 
 @dataclass
 class ParsedDataset:
-    file_name: str
-    data_type: str
-    dataframe: pd.DataFrame
-    source_label: str
-    device_id: str | None = None
-    group_name: str | None = None
+    """Container for a parsed and validated CSV dataset."""
 
-
-def _read_csv_from_bytes(raw_bytes: bytes, file_name: str) -> pd.DataFrame:
-    if file_name.lower().endswith(".zip"):
-        with zipfile.ZipFile(io.BytesIO(raw_bytes)) as archive:
-            csv_names = [name for name in archive.namelist() if name.lower().endswith(".csv")]
-            if not csv_names:
-                raise ValueError(f"{file_name} does not contain a CSV file.")
-            with archive.open(csv_names[0]) as member:
-                return pd.read_csv(member)
-    return pd.read_csv(io.BytesIO(raw_bytes))
+    df: pd.DataFrame
+    dataset_type: str                    # "device" or "network"
+    device_id: int | None = None         # Only for device files
+    group_name: str | None = None        # Only for network files
+    filename: str = ""
+    row_count: int = 0
+    date_min: pd.Timestamp | None = None
+    date_max: pd.Timestamp | None = None
+    warnings: list[str] = field(default_factory=list)
 
 
 def detect_dataset_type(df: pd.DataFrame) -> str:
-    columns = {column.strip() for column in df.columns}
-    if DEVICE_REQUIRED_COLUMNS.issubset(columns):
+    """Identify whether a DataFrame is device or network coherence data."""
+    columns = {col.strip().lower() for col in df.columns}
+    normalized_device = {c.lower() for c in DEVICE_REQUIRED_COLUMNS}
+    normalized_network = {c.lower() for c in NETWORK_REQUIRED_COLUMNS}
+
+    if normalized_device.issubset(columns):
         return "device"
-    if NETWORK_REQUIRED_COLUMNS.issubset(columns):
+    elif normalized_network.issubset(columns):
         return "network"
-    raise ValueError(
-        "Unsupported CSV schema. Expected device columns "
-        f"{sorted(DEVICE_REQUIRED_COLUMNS)} or network columns {sorted(NETWORK_REQUIRED_COLUMNS)}."
-    )
+    return "unknown"
 
 
-def _extract_group_name(file_name: str) -> str | None:
-    stem = Path(file_name).stem
-    stem = stem.removesuffix(".csv")
-    match = re.search(r"Network_Coherence_(.+?)(?:_\d{4}_\d{2})?$", stem, re.IGNORECASE)
+def _read_csv_from_bytes(raw: bytes) -> pd.DataFrame:
+    """Read CSV from raw bytes, handling common encoding issues."""
+    return pd.read_csv(io.BytesIO(raw))
+
+
+def _extract_csv_from_zip(raw: bytes) -> tuple[bytes, str]:
+    """Extract the first CSV file found inside a ZIP archive."""
+    with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+        csv_names = [n for n in zf.namelist() if n.lower().endswith(".csv")]
+        if not csv_names:
+            raise ValueError("ZIP file contains no CSV files")
+        name = csv_names[0]
+        return zf.read(name), name
+
+
+def _extract_device_id(df: pd.DataFrame, filename: str) -> int | None:
+    """Extract device ID from data column or filename."""
+    if "device_number" in df.columns and not df["device_number"].empty:
+        return int(df["device_number"].iloc[0])
+
+    match = re.search(r"[Dd]evice[_\s-]?(\d+)", filename)
     if match:
-        return match.group(1).replace("_", " ").strip()
+        return int(match.group(1))
     return None
 
 
-def parse_uploaded_file(raw_bytes: bytes, file_name: str) -> ParsedDataset:
-    df = _read_csv_from_bytes(raw_bytes, file_name)
-    df.columns = [column.strip() for column in df.columns]
-    dataset_type = detect_dataset_type(df)
+def _extract_group_name(filename: str) -> str:
+    """Extract network group name from filename pattern."""
+    # e.g. "GCP2_Network_Coherence_Global_Network_2026_03.csv"
+    match = re.search(r"Network_Coherence_(.+?)(?:_\d{4}|\.csv)", filename)
+    if match:
+        return match.group(1).replace("_", " ")
+    return "Network"
 
-    if dataset_type == "device":
-        parsed = _normalize_device_df(df)
-        device_id = str(parsed["device_number"].iloc[0]) if not parsed.empty else None
-        label = f"Device {device_id}" if device_id else file_name
-        return ParsedDataset(
-            file_name=file_name,
-            data_type=dataset_type,
-            dataframe=parsed,
-            source_label=label,
-            device_id=device_id,
+
+def _normalize_device_df(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
+    """Normalize and validate a device coherence DataFrame."""
+    warnings: list[str] = []
+
+    df["device_number"] = pd.to_numeric(df["device_number"], errors="coerce")
+    df["epoch_time_utc"] = pd.to_numeric(df["epoch_time_utc"], errors="coerce")
+    df["active_seconds"] = pd.to_numeric(df["active_seconds"], errors="coerce")
+    df["device_coherence"] = pd.to_numeric(df["device_coherence"], errors="coerce")
+
+    before = len(df)
+    df = df.dropna(subset=["epoch_time_utc", "device_coherence"])
+    dropped = before - len(df)
+    if dropped > 0:
+        warnings.append(f"Dropped {dropped} rows with invalid numeric values")
+
+    df["datetime_utc"] = pd.to_datetime(df["epoch_time_utc"], unit="s", utc=True)
+    df = df.sort_values("datetime_utc").reset_index(drop=True)
+
+    low_coverage = (df["active_seconds"] < 3600).sum()
+    if low_coverage > 0:
+        warnings.append(f"{low_coverage} rows have active_seconds < 3600 (partial hours)")
+
+    return df, warnings
+
+
+def _normalize_network_df(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
+    """Normalize and validate a network coherence DataFrame."""
+    warnings: list[str] = []
+
+    df["epoch_time_utc"] = pd.to_numeric(df["epoch_time_utc"], errors="coerce")
+    df["network_coherence"] = pd.to_numeric(df["network_coherence"], errors="coerce")
+    df["active_devices"] = pd.to_numeric(df["active_devices"], errors="coerce")
+
+    before = len(df)
+    df = df.dropna(subset=["epoch_time_utc", "network_coherence"])
+    dropped = before - len(df)
+    if dropped > 0:
+        warnings.append(f"Dropped {dropped} rows with invalid numeric values")
+
+    df["datetime_utc"] = pd.to_datetime(df["epoch_time_utc"], unit="s", utc=True)
+    df = df.sort_values("datetime_utc").reset_index(drop=True)
+
+    device_range = df["active_devices"].max() - df["active_devices"].min()
+    if device_range > 10:
+        warnings.append(
+            f"Active device count varies by {int(device_range)} "
+            f"({int(df['active_devices'].min())} to {int(df['active_devices'].max())})"
         )
 
-    parsed = _normalize_network_df(df)
-    group_name = _extract_group_name(file_name) or "Network Group"
-    return ParsedDataset(
-        file_name=file_name,
-        data_type=dataset_type,
-        dataframe=parsed,
-        source_label=group_name,
-        group_name=group_name,
-    )
+    return df, warnings
 
 
-def _normalize_device_df(df: pd.DataFrame) -> pd.DataFrame:
-    normalized = df.copy()
-    normalized["device_number"] = normalized["device_number"].astype(str)
-    normalized["epoch_time_utc"] = pd.to_numeric(normalized["epoch_time_utc"], errors="coerce").astype("Int64")
-    normalized["active_seconds"] = pd.to_numeric(normalized["active_seconds"], errors="coerce")
-    normalized["device_coherence"] = pd.to_numeric(normalized["device_coherence"], errors="coerce")
-    normalized["significance"] = normalized["significance"].astype(str).str.strip()
-    normalized = normalized.dropna(subset=["epoch_time_utc", "device_coherence"]).copy()
-    normalized["datetime_utc"] = pd.to_datetime(normalized["epoch_time_utc"], unit="s", utc=True)
-    return normalized.sort_values("datetime_utc").reset_index(drop=True)
+def _check_time_gaps(df: pd.DataFrame, expected_interval: int) -> list[str]:
+    """Detect gaps in the time series."""
+    warnings: list[str] = []
+    if len(df) < 2:
+        return warnings
+
+    diffs = df["epoch_time_utc"].diff().dropna()
+    gap_threshold = expected_interval * 3
+    gaps = diffs[diffs > gap_threshold]
+
+    if len(gaps) > 0:
+        warnings.append(
+            f"Detected {len(gaps)} time gaps larger than {gap_threshold}s "
+            f"(max gap: {int(gaps.max())}s)"
+        )
+
+    dupes = df["epoch_time_utc"].duplicated().sum()
+    if dupes > 0:
+        warnings.append(f"{dupes} duplicate timestamps found")
+
+    return warnings
 
 
-def _normalize_network_df(df: pd.DataFrame) -> pd.DataFrame:
-    normalized = df.copy()
-    normalized["epoch_time_utc"] = pd.to_numeric(normalized["epoch_time_utc"], errors="coerce").astype("Int64")
-    normalized["network_coherence"] = pd.to_numeric(normalized["network_coherence"], errors="coerce")
-    normalized["active_devices"] = pd.to_numeric(normalized["active_devices"], errors="coerce")
-    normalized = normalized.dropna(subset=["epoch_time_utc", "network_coherence"]).copy()
-    normalized["datetime_utc"] = pd.to_datetime(normalized["epoch_time_utc"], unit="s", utc=True)
-    return normalized.sort_values("datetime_utc").reset_index(drop=True)
+def parse_uploaded_file(raw_bytes: bytes, filename: str) -> ParsedDataset:
+    """
+    Parse an uploaded file (CSV or ZIP) into a validated ParsedDataset.
+
+    This is the main entry point for file ingestion.
+    """
+    # Extract CSV content
+    if filename.lower().endswith(".zip"):
+        csv_bytes, inner_name = _extract_csv_from_zip(raw_bytes)
+        source_name = inner_name
+    else:
+        csv_bytes = raw_bytes
+        source_name = filename
+
+    # Read and normalize column names
+    df = _read_csv_from_bytes(csv_bytes)
+    df.columns = [col.strip() for col in df.columns]
+
+    # Detect type
+    dataset_type = detect_dataset_type(df)
+    if dataset_type == "unknown":
+        device_cols = ", ".join(sorted(DEVICE_REQUIRED_COLUMNS))
+        network_cols = ", ".join(sorted(NETWORK_REQUIRED_COLUMNS))
+        raise ValueError(
+            f"Could not identify file type from columns: {list(df.columns)}.\n"
+            f"Expected Device columns: {device_cols}\n"
+            f"Expected Network columns: {network_cols}"
+        )
+
+    # Normalize based on type
+    all_warnings: list[str] = []
+
+    if dataset_type == "device":
+        df, warnings = _normalize_device_df(df)
+        all_warnings.extend(warnings)
+        all_warnings.extend(_check_time_gaps(df, expected_interval=60))
+
+        device_id = _extract_device_id(df, source_name)
+        return ParsedDataset(
+            df=df,
+            dataset_type="device",
+            device_id=device_id,
+            filename=filename,
+            row_count=len(df),
+            date_min=df["datetime_utc"].min() if len(df) > 0 else None,
+            date_max=df["datetime_utc"].max() if len(df) > 0 else None,
+            warnings=all_warnings,
+        )
+    else:
+        df, warnings = _normalize_network_df(df)
+        all_warnings.extend(warnings)
+        all_warnings.extend(_check_time_gaps(df, expected_interval=1))
+
+        group_name = _extract_group_name(source_name)
+        return ParsedDataset(
+            df=df,
+            dataset_type="network",
+            group_name=group_name,
+            filename=filename,
+            row_count=len(df),
+            date_min=df["datetime_utc"].min() if len(df) > 0 else None,
+            date_max=df["datetime_utc"].max() if len(df) > 0 else None,
+            warnings=all_warnings,
+        )
