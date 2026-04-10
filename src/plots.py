@@ -179,10 +179,11 @@ def device_timeline_chart(
     show_thresholds: bool = True,
 ) -> go.Figure:
     """
-    Device coherence line chart colored by significance level.
+    Device coherence line chart with a single continuous line that
+    changes color at significance transitions.
 
-    Each significance level is a separate trace so colors change
-    along the timeline as the device transitions between states.
+    Consecutive runs of the same significance are plotted as segments
+    that overlap by one point at boundaries so the line is seamless.
 
     use_led_colors: True = hardware LED colors (Magenta/Cyan/Yellow/Orange/Gold)
                     False = muted print-friendly palette
@@ -192,36 +193,84 @@ def device_timeline_chart(
 
     fig = go.Figure()
 
-    # Plot each significance level as a separate trace
-    for level in SIGNIFICANCE_ORDER:
-        subset = df[df["significance"] == level]
-        if subset.empty:
-            continue
+    if df.empty:
+        return fig
+
+    sorted_df = df.sort_values(display_col).reset_index(drop=True)
+
+    # Build segments of consecutive same-significance rows
+    segments: list[tuple[str, int, int]] = []  # (significance, start_idx, end_idx)
+    current_sig = sorted_df.iloc[0]["significance"]
+    seg_start = 0
+    for i in range(1, len(sorted_df)):
+        if sorted_df.iloc[i]["significance"] != current_sig:
+            segments.append((current_sig, seg_start, i - 1))
+            current_sig = sorted_df.iloc[i]["significance"]
+            seg_start = i
+    segments.append((current_sig, seg_start, len(sorted_df) - 1))
+
+    # Plot each segment, extending one point into neighbor for continuity
+    legend_added: set[str] = set()
+    for sig, s, e in segments:
+        # Include one extra point on each end so segments connect
+        plot_start = s if s == 0 else s - 1
+        plot_end = e if e == len(sorted_df) - 1 else e + 1
+        subset = sorted_df.iloc[plot_start: plot_end + 1]
+
+        show_legend = sig not in legend_added
+        legend_added.add(sig)
+
         fig.add_trace(go.Scatter(
             x=subset[display_col],
             y=subset["device_coherence"],
-            mode="markers+lines",
-            name=level,
-            marker=dict(color=colors[level], size=5),
-            line=dict(color=colors[level], width=LINE_WIDTH_DEVICE),
+            mode="lines",
+            name=sig,
+            showlegend=show_legend,
+            legendgroup=sig,
+            line=dict(color=colors[sig], width=LINE_WIDTH_DEVICE),
             hovertemplate=(
                 "Time: %{x}<br>"
-                f"Coherence: %{{y:.1f}} ({level})<extra></extra>"
+                f"Coherence: %{{y:.1f}} ({sig})<extra></extra>"
             ),
         ))
 
+    # Extreme significance background bands
+    extreme_segs = [seg for seg in segments if seg[0] == "Extreme"]
+    for _, s, e in extreme_segs:
+        x0 = sorted_df.iloc[s][display_col]
+        x1 = sorted_df.iloc[e][display_col]
+        fig.add_vrect(
+            x0=x0, x1=x1,
+            fillcolor="rgba(255, 0, 0, 0.08)",
+            line_width=0,
+            layer="below",
+        )
+
+    # Peak annotation
+    peak_idx = sorted_df["device_coherence"].idxmax()
+    peak_row = sorted_df.iloc[peak_idx]
+    peak_sig = peak_row["significance"]
+    fig.add_annotation(
+        x=peak_row[display_col],
+        y=peak_row["device_coherence"],
+        text=f"Peak: {peak_row['device_coherence']:.1f} ({peak_sig})",
+        showarrow=True,
+        arrowhead=2,
+        arrowsize=1,
+        arrowcolor="#666666",
+        font=dict(size=10, color="#333333"),
+        bgcolor="rgba(255,255,255,0.8)",
+        bordercolor="#999999",
+        borderwidth=1,
+        yshift=10,
+    )
+
     # Significance threshold lines
     if show_thresholds:
-        threshold_colors = {
-            "Elevated": "#00CCCC",
-            "High": "#CCCC00",
-            "Very High": "#CC8800",
-            "Extreme": "#CC9900",
-        }
         for level_name, value in SIGNIFICANCE_BOUNDARY_VALUES.items():
             fig.add_hline(
                 y=value,
-                line_color=threshold_colors.get(level_name, "#AAAAAA"),
+                line_color=colors.get(level_name, "#AAAAAA"),
                 line_width=LINE_WIDTH_THRESHOLD,
                 line_dash="dash",
                 annotation_text=f"{level_name} ({value})",
